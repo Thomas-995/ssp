@@ -1,0 +1,5 @@
+[workspace]
+members = [
+  "ssp_client",
+  "ssp_bootstrap",
+]

@@ -1,0 +1,22 @@
+[package]
+name = "ssp-bootstrap"
+version = "0.1.0"
+edition = "2021"
+description = "Bootstrap peer-discovery server for SSP (Slippi Secured Protocol)"
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+axum = "0.7"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros", "signal"] }
+tracing-subscriber = "0.3"
+
+[[bin]]
+name = "ssp-bootstrap"
+path = "src/main.rs"
+
+[lib]
+name = "ssp_bootstrap"
+path = "src/lib.rs"
