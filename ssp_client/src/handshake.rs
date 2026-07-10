@@ -8,7 +8,7 @@ use iroh::endpoint::{Accepting, Connection};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh_gossip::net::Gossip;
 
-use debug_print::{debug_eprintln, debug_println};
+use debug_print::debug_println;
 use serde::{Deserialize, Serialize};
 
 /// Current SSP protocol version. Incremented when breaking handshake/network
@@ -388,7 +388,7 @@ impl ProtocolHandler for HandshakeGuard {
                     );
                     if config_changed {
                         if let Some(ref tx) = handshake_succ_tx {
-                            let _ = tx.send((accept.rollover.preferred, accept.rollover.preferred));
+                            let _ = tx.send((accept.rollover.preferred, accept.offset.preferred));
                         }
                     }
                     self.discovery_cancel.cancel(); // Cancel discovery on successful incoming connection
@@ -511,18 +511,15 @@ pub async fn perform_handshake(
                             hs.config.rollover.max,
                         )
                     })?;
-            hs.config.offset = accept
-                .rollover
-                .intersect(&hs.config.offset)
-                .ok_or_else(|| {
-                    format!(
-                        "offset range [{}, {}] does not overlap group window [{}, {}]",
-                        offer.config.offset.min,
-                        offer.config.offset.max,
-                        hs.config.rollover.min,
-                        hs.config.rollover.max,
-                    )
-                })?;
+            hs.config.offset = accept.offset.intersect(&hs.config.offset).ok_or_else(|| {
+                format!(
+                    "offset range [{}, {}] does not overlap group window [{}, {}]",
+                    offer.config.offset.min,
+                    offer.config.offset.max,
+                    hs.config.offset.min,
+                    hs.config.offset.max,
+                )
+            })?;
 
             Ok(conn)
         }

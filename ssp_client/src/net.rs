@@ -833,7 +833,9 @@ impl GameNet {
             session_hash.to_vec(),
         );
 
-        if (!bootstrap_success || initial_peers.is_empty()) && discovery != DiscoveryMode::BootstrapOnly {
+        if (!bootstrap_success || initial_peers.is_empty())
+            && discovery != DiscoveryMode::BootstrapOnly
+        {
             debug_println!(
                 "[{:?}] Fetching peers from BitTorrent DHT",
                 setup_started_at.elapsed()
@@ -1052,7 +1054,8 @@ impl GameNet {
         let peer_connected_on_connect = peer_connected_tx.clone();
 
         tokio::spawn(async move {
-            let active_peers: Arc<Mutex<HashSet<EndpointId>>> = Arc::new(Mutex::new(HashSet::new()));
+            let active_peers: Arc<Mutex<HashSet<EndpointId>>> =
+                Arc::new(Mutex::new(HashSet::new()));
             let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             while let Some(candidate) = candidate_rx.recv().await {
@@ -1332,6 +1335,7 @@ impl GameNet {
 
         let consumer_msg_buf = Arc::new(Mutex::new(Vec::new()));
         let consumer_msg_buf_for_task = consumer_msg_buf.clone();
+        let (gossip_joined_tx, mut gossip_joined_rx) = tokio::sync::watch::channel(false);
 
         tokio::spawn(async move {
             let mut gossip_recv = gossip_recv;
@@ -1339,17 +1343,32 @@ impl GameNet {
                 debug_eprintln!("Failed while waiting for gossip join: {:?}", e);
                 return;
             }
+            let _ = gossip_joined_tx.send(true);
             GameNet::msg_consumer(gossip_recv, consumer_msg_buf_for_task).await;
         });
 
         let connection_state_for_task = connection_state.clone();
         tokio::spawn(async move {
-            while !*peer_connected_rx.borrow() {
-                if peer_connected_rx.changed().await.is_err() {
+            loop {
+                if *peer_connected_rx.borrow() && *gossip_joined_rx.borrow() {
+                    connection_state_for_task
+                        .store(ConnectionState::Discovered as u8, Ordering::Relaxed);
                     return;
                 }
+
+                tokio::select! {
+                    changed = peer_connected_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = gossip_joined_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
             }
-            connection_state_for_task.store(ConnectionState::Discovered as u8, Ordering::Relaxed);
         });
 
         let initial_peer_seed_hash = *current_seed_hash.lock().await;
