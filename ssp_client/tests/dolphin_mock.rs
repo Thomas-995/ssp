@@ -318,11 +318,13 @@ async fn wait_for_state(
         }
         sleep(Duration::from_millis(50)).await;
     }
+    let current = session.state().await;
+    if current == expected {
+        return Ok(());
+    }
     Err(format!(
         "session did not reach state {:?} within {:?}; current state is {:?}",
-        expected,
-        timeout,
-        session.state().await
+        expected, timeout, current
     ))
 }
 

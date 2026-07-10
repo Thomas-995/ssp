@@ -1,11 +1,11 @@
 //! Session API
 
 use crate::crypter::{CrypterInput, CrypterUpdate, SLPcrypter};
-use crate::dolphin::{DolphinEvent, SLPreader};
+use crate::dolphin::{DolphinEvent, GameMeta, SLPreader};
 use crate::handshake::{HandshakeConfig, ParamRange, SSP_VERSION};
 use crate::msg::Msg;
-use crate::net::GameNet;
-use std::sync::atomic::{AtomicU8, Ordering};
+use crate::net::{AppIo, DolphinIo, GameNet, GameNetConnectArgs, NetworkConfig, SessionRuntime};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -152,6 +152,10 @@ impl Session {
 
     pub async fn state(&self) -> SessionState {
         *self.session_state.lock().await
+    }
+
+    pub fn try_state(&self) -> Option<SessionState> {
+        self.session_state.try_lock().ok().map(|state| *state)
     }
 
     pub async fn in_game(&self) -> bool {
@@ -342,6 +346,8 @@ impl SessionBuilder {
             }
         };
 
+        let (net_gameevent_tx, net_gameevent_rx) = unbounded_channel::<DolphinEvent>();
+
         let send_buf_clone = send_buf.clone();
         let encryption_enabled = self.encryption_enabled;
         let bootstrap_url = Some(
@@ -356,9 +362,35 @@ impl SessionBuilder {
         let net_session_state = session_state.clone();
         let connection_state = Arc::new(AtomicU8::new(ConnectionState::Discovering as u8));
         let net_connection_state = connection_state.clone();
+        let peer_handshook = Arc::new(AtomicBool::new(false));
+        let net_peer_handshook = peer_handshook.clone();
 
         let timeouts = self.timeouts;
         let max_packet_length = self.max_packet_length;
+
+        let initial_meta: GameMeta = meta.clone();
+        let event_session_state = session_state.clone();
+        let event_peer_handshook = peer_handshook.clone();
+        let event_cancel_token = session_cancel_token.clone();
+        tokio::spawn(async move {
+            while let Some(event) = gameevent_rx.recv().await {
+                if let DolphinEvent::NewGame(new_meta) = &event {
+                    if new_meta.seed != initial_meta.seed
+                        && !event_peer_handshook.load(Ordering::Relaxed)
+                    {
+                        if let Ok(mut state) = event_session_state.try_lock() {
+                            *state = SessionState::Ended;
+                        } else {
+                            *event_session_state.lock().await = SessionState::Ended;
+                        }
+                        event_cancel_token.cancel();
+                    }
+                }
+                if net_gameevent_tx.send(event).is_err() {
+                    break;
+                }
+            }
+        });
 
         tokio::spawn(async move {
             let bootstrap_relay_url = match relay_url.parse::<iroh::RelayUrl>() {
@@ -367,24 +399,34 @@ impl SessionBuilder {
                     panic!("[net] invalid relay URL '{}': {}", relay_url, e);
                 }
             };
-            GameNet::connect(
+            GameNet::connect(GameNetConnectArgs {
                 meta,
-                net_session_state,
-                net_connection_state,
-                encryption_enabled,
-                discovery_mode,
-                handshake_config,
-                bootstrap_url,
-                bootstrap_relay_url,
-                send_buf_clone,
-                incoming_msgs_tx,
-                crypter_key_rx,
-                gameevent_rx,
-                handshake_succ_tx,
-                session_cancel_token,
-                timeouts,
-                max_packet_length,
-            )
+                runtime: SessionRuntime {
+                    session_state: net_session_state,
+                    connection_state: net_connection_state,
+                    session_cancel_token,
+                    peer_handshook: net_peer_handshook,
+                },
+                config: NetworkConfig {
+                    encryption_enabled,
+                    discovery_mode,
+                    handshake_config,
+                    bootstrap_url: bootstrap_url
+                        .unwrap_or_else(|| DEFAULT_BOOTSTRAP_URL.to_string()),
+                    bootstrap_relay_url,
+                    timeouts,
+                    max_packet_length,
+                },
+                app_io: AppIo {
+                    send_buf: send_buf_clone,
+                    incoming_msgs_tx,
+                },
+                dolphin_io: DolphinIo {
+                    crypter_key_rx,
+                    gameevent_rx: net_gameevent_rx,
+                    handshake_succ_tx,
+                },
+            })
             .await;
         });
 

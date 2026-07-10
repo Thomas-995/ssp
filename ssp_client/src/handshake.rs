@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), allow(unused_variables))]
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -225,6 +226,15 @@ impl HandshakeState {
 
 use tokio_util::sync::CancellationToken;
 
+pub(crate) struct HandshakeGuardArgs {
+    pub(crate) gossip: Gossip,
+    pub(crate) state: Arc<Mutex<HandshakeState>>,
+    pub(crate) handshake_succ_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64)>>,
+    pub(crate) discovery_cancel: CancellationToken,
+    pub(crate) peer_connected_tx: tokio::sync::watch::Sender<bool>,
+    pub(crate) peer_handshook: Arc<AtomicBool>,
+}
+
 #[derive(Clone)]
 pub struct HandshakeGuard {
     gossip: Gossip,
@@ -232,6 +242,7 @@ pub struct HandshakeGuard {
     handshake_succ_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64)>>,
     discovery_cancel: CancellationToken,
     peer_connected_tx: tokio::sync::watch::Sender<bool>,
+    peer_handshook: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for HandshakeGuard {
@@ -241,19 +252,14 @@ impl std::fmt::Debug for HandshakeGuard {
 }
 
 impl HandshakeGuard {
-    pub fn new(
-        gossip: Gossip,
-        state: Arc<Mutex<HandshakeState>>,
-        handshake_succ_tx: Option<tokio::sync::mpsc::UnboundedSender<(u64, u64)>>,
-        discovery_cancel: CancellationToken,
-        peer_connected_tx: tokio::sync::watch::Sender<bool>,
-    ) -> Self {
+    pub(crate) fn new(args: HandshakeGuardArgs) -> Self {
         Self {
-            gossip,
-            state,
-            handshake_succ_tx,
-            discovery_cancel,
-            peer_connected_tx,
+            gossip: args.gossip,
+            state: args.state,
+            handshake_succ_tx: args.handshake_succ_tx,
+            discovery_cancel: args.discovery_cancel,
+            peer_connected_tx: args.peer_connected_tx,
+            peer_handshook: args.peer_handshook,
         }
     }
 }
@@ -408,8 +414,10 @@ impl ProtocolHandler for HandshakeGuard {
     fn accept(&self, conn: Connection) -> impl Future<Output = Result<(), AcceptError>> + Send {
         let gossip = self.gossip.clone();
         let peer_connected_tx = self.peer_connected_tx.clone();
+        let peer_handshook = self.peer_handshook.clone();
         async move {
             gossip.accept(conn).await?;
+            peer_handshook.store(true, Ordering::Relaxed);
             let _ = peer_connected_tx.send(true);
             Ok(())
         }

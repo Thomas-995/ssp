@@ -2,11 +2,10 @@
 
 use crate::crypter::CrypterUpdate;
 use crate::dolphin::{DolphinEvent, GameMeta};
-use crate::game::{
-    ConnectionState, DiscoveryMode, SessionState, TimeoutConfig, DEFAULT_BOOTSTRAP_URL,
-};
+use crate::game::{ConnectionState, DiscoveryMode, SessionState, TimeoutConfig};
 use crate::handshake::{
-    self, HandshakeConfig, HandshakeGuard, HandshakeState, SSP_ALPN, SSP_VERSION,
+    self, HandshakeConfig, HandshakeGuard, HandshakeGuardArgs, HandshakeState, SSP_ALPN,
+    SSP_VERSION,
 };
 use crate::msg::{Msg, MsgPayload, SLPMsg, SLPMsgData};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -24,7 +23,7 @@ use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::state::TopicId;
 use rand::RngCore;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
@@ -66,6 +65,71 @@ struct PeerCandidate {
     #[cfg(debug_assertions)]
     via_bootstrap: bool,
     discovered_at: tokio::time::Instant,
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionRuntime {
+    pub(crate) session_state: Arc<Mutex<SessionState>>,
+    pub(crate) connection_state: Arc<AtomicU8>,
+    pub(crate) session_cancel_token: CancellationToken,
+    pub(crate) peer_handshook: Arc<AtomicBool>,
+}
+
+pub(crate) struct NetworkConfig {
+    pub(crate) encryption_enabled: bool,
+    pub(crate) discovery_mode: DiscoveryMode,
+    pub(crate) handshake_config: HandshakeConfig,
+    pub(crate) bootstrap_url: String,
+    pub(crate) bootstrap_relay_url: Option<iroh::RelayUrl>,
+    pub(crate) timeouts: TimeoutConfig,
+    pub(crate) max_packet_length: usize,
+}
+
+pub(crate) struct AppIo {
+    pub(crate) send_buf: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub(crate) incoming_msgs_tx: UnboundedSender<Msg>,
+}
+
+pub(crate) struct DolphinIo {
+    pub(crate) crypter_key_rx: Option<UnboundedReceiver<CrypterUpdate>>,
+    pub(crate) gameevent_rx: UnboundedReceiver<DolphinEvent>,
+    pub(crate) handshake_succ_tx: Option<UnboundedSender<(u64, u64)>>,
+}
+
+pub(crate) struct GameNetConnectArgs {
+    pub(crate) meta: GameMeta,
+    pub(crate) runtime: SessionRuntime,
+    pub(crate) config: NetworkConfig,
+    pub(crate) app_io: AppIo,
+    pub(crate) dolphin_io: DolphinIo,
+}
+
+struct DiscoveryConfig {
+    gametopic: String,
+    secret_seed: [u8; 32],
+    slp_version: [u8; 3],
+    discovery_mode: DiscoveryMode,
+    bootstrap_url: String,
+    bootstrap_relay_url: Option<iroh::RelayUrl>,
+    timeouts: TimeoutConfig,
+}
+
+#[derive(Clone)]
+struct DiscoveryRuntime {
+    endpoint: Arc<Endpoint>,
+    gossip: Gossip,
+    handshake_state: Arc<Mutex<HandshakeState>>,
+    static_discovery: StaticProvider,
+    discovery_cancel: CancellationToken,
+    peer_connected_tx: tokio::sync::watch::Sender<bool>,
+    peer_handshook: Arc<AtomicBool>,
+}
+
+struct DiscoverySetup {
+    sender: GossipSender,
+    receiver: GossipReceiver,
+    dtt_reannounce: Option<DttReannounceState>,
+    bootstrap_session_hash: [u8; 32],
 }
 
 fn get_hashed_seed(seed: &str) -> [u8; 32] {
@@ -139,9 +203,13 @@ impl GameNet {
         while let Ok(event) = self.gameevent_rx.try_recv() {
             match event {
                 DolphinEvent::NewGame(meta) => {
+                    if *self.session_state.lock().await == SessionState::Ended {
+                        return;
+                    }
                     debug_println!("Received NewGame event");
                     let seed_str = format!("{:08x}", meta.seed);
                     let new_hash = get_hashed_seed(&seed_str);
+
                     {
                         let mut guard = self.current_seed_hash.lock().await;
                         *guard = new_hash;
@@ -747,27 +815,26 @@ impl GameNet {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn setup_discovery(
-        gametopicstr: &str,
-        secret_seed: [u8; 32],
-        endpoint: Arc<Endpoint>,
-        gossip: Gossip,
-        slp_version: [u8; 3],
-        handshake_state: Arc<Mutex<HandshakeState>>,
-        static_discovery: StaticProvider,
-        discovery: DiscoveryMode,
-        bootstrap_url: String,
-        bootstrap_relay_url: Option<iroh::RelayUrl>,
-        discovery_cancel: CancellationToken,
-        timeouts: TimeoutConfig,
-        peer_connected_tx: tokio::sync::watch::Sender<bool>,
-    ) -> (
-        GossipSender,
-        GossipReceiver,
-        Option<DttReannounceState>,
-        [u8; 32],
-    ) {
+    async fn setup_discovery(config: DiscoveryConfig, runtime: DiscoveryRuntime) -> DiscoverySetup {
+        let DiscoveryConfig {
+            gametopic,
+            secret_seed,
+            slp_version,
+            discovery_mode,
+            bootstrap_url,
+            bootstrap_relay_url,
+            timeouts,
+        } = config;
+        let DiscoveryRuntime {
+            endpoint,
+            gossip,
+            handshake_state,
+            static_discovery,
+            discovery_cancel,
+            peer_connected_tx,
+            peer_handshook,
+        } = runtime;
+        let gametopicstr = gametopic.as_str();
         let setup_started_at = tokio::time::Instant::now();
         let (candidate_tx, mut candidate_rx) =
             tokio::sync::mpsc::unbounded_channel::<PeerCandidate>();
@@ -779,43 +846,54 @@ impl GameNet {
         let mut bootstrap_success = false;
 
         // Bootstrap Discovery
-        if discovery != DiscoveryMode::DhtOnly {
+        if !discovery_cancel.is_cancelled() && discovery_mode != DiscoveryMode::DhtOnly {
             debug_println!(
                 "[{:?}] Fetching peers from SSP server (initial)",
                 setup_started_at.elapsed()
             );
             let fetch_started_at = tokio::time::Instant::now();
-            match Self::fetch_bootstrap_peers(
-                &bootstrap_url,
-                gametopicstr,
-                &my_addr,
-                timeouts.http_bootstrap_ms,
-            )
-            .await
-            {
-                Ok((session_hex, peers)) => {
-                    debug_println!(
-                        "[{:?}] Initial SSP fetch returned {} peer(s) after {:?}",
-                        setup_started_at.elapsed(),
-                        peers.len(),
-                        fetch_started_at.elapsed()
-                    );
-                    if let Ok(decoded) = hex::decode(&session_hex) {
-                        if decoded.len() == 32 {
-                            session_hash.copy_from_slice(&decoded);
+            let fetch_result = tokio::select! {
+                result = Self::fetch_bootstrap_peers(
+                    &bootstrap_url,
+                    gametopicstr,
+                    &my_addr,
+                    timeouts.http_bootstrap_ms,
+                ) => Some(result),
+                _ = discovery_cancel.cancelled() => None,
+            };
+            match fetch_result {
+                Some(result) => match result {
+                    Ok((session_hex, peers)) => {
+                        debug_println!(
+                            "[{:?}] Initial SSP fetch returned {} peer(s) after {:?}",
+                            setup_started_at.elapsed(),
+                            peers.len(),
+                            fetch_started_at.elapsed()
+                        );
+                        if let Ok(decoded) = hex::decode(&session_hex) {
+                            if decoded.len() == 32 {
+                                session_hash.copy_from_slice(&decoded);
+                            }
                         }
+                        for peer_addr in peers {
+                            initial_peers.push((peer_addr, true));
+                        }
+                        bootstrap_success = true;
                     }
-                    for peer_addr in peers {
-                        initial_peers.push((peer_addr, true));
+                    Err(e) => {
+                        debug_eprintln!(
+                            "[{:?}] Failed to fetch peers from bootstrap server after {:?}: {}",
+                            setup_started_at.elapsed(),
+                            fetch_started_at.elapsed(),
+                            e
+                        );
                     }
-                    bootstrap_success = true;
-                }
-                Err(e) => {
-                    debug_eprintln!(
-                        "[{:?}] Failed to fetch peers from bootstrap server after {:?}: {}",
+                },
+                None => {
+                    debug_println!(
+                        "[{:?}] Initial bootstrap fetch cancelled after {:?}",
                         setup_started_at.elapsed(),
-                        fetch_started_at.elapsed(),
-                        e
+                        fetch_started_at.elapsed()
                     );
                 }
             }
@@ -833,8 +911,9 @@ impl GameNet {
             session_hash.to_vec(),
         );
 
-        if (!bootstrap_success || initial_peers.is_empty())
-            && discovery != DiscoveryMode::BootstrapOnly
+        if !discovery_cancel.is_cancelled()
+            && (!bootstrap_success || initial_peers.is_empty())
+            && discovery_mode != DiscoveryMode::BootstrapOnly
         {
             debug_println!(
                 "[{:?}] Fetching peers from BitTorrent DHT",
@@ -930,7 +1009,7 @@ impl GameNet {
         let failed_peers: Arc<Mutex<HashSet<EndpointId>>> = Arc::new(Mutex::new(HashSet::new()));
 
         // Start Background Discovery Tasks
-        let dtt_reannounce = if discovery != DiscoveryMode::BootstrapOnly {
+        let dtt_reannounce = if discovery_mode != DiscoveryMode::BootstrapOnly {
             Some(DttReannounceState {
                 session_hash,
                 signing_key: signing_key.clone(),
@@ -939,7 +1018,7 @@ impl GameNet {
             None
         };
 
-        if discovery != DiscoveryMode::DhtOnly {
+        if !discovery_cancel.is_cancelled() && discovery_mode != DiscoveryMode::DhtOnly {
             let tx_clone = candidate_tx.clone();
             let static_clone = static_discovery.clone();
             let bootstrap_url_clone = bootstrap_url.clone();
@@ -994,7 +1073,7 @@ impl GameNet {
             });
         }
 
-        if discovery != DiscoveryMode::BootstrapOnly {
+        if !discovery_cancel.is_cancelled() && discovery_mode != DiscoveryMode::BootstrapOnly {
             let tx_clone = candidate_tx.clone();
             let cancel_clone = discovery_cancel.clone();
             let failed_peers_clone = failed_peers.clone();
@@ -1088,6 +1167,7 @@ impl GameNet {
                 let failed_peers_for_task = failed_peers.clone();
                 let active_peers_for_task = active_peers.clone();
                 let peer_connected_for_task = peer_connected_on_connect.clone();
+                let peer_handshook_for_task = peer_handshook.clone();
 
                 let handle = tokio::spawn(async move {
                     let handshake_started_at = tokio::time::Instant::now();
@@ -1128,6 +1208,7 @@ impl GameNet {
                                         e
                                     );
                                 }
+                                peer_handshook_for_task.store(true, Ordering::Relaxed);
                                 let _ = peer_connected_for_task.send(true);
                                 debug_println!(
                                     "[{:?}] Connected to peer {:?} (handshake task {:?}, candidate age {:?})",
@@ -1194,6 +1275,7 @@ impl GameNet {
                                                     e
                                                 );
                                             }
+                                            peer_handshook_for_task.store(true, Ordering::Relaxed);
                                             let _ = peer_connected_for_task.send(true);
                                             debug_println!(
                                                 "[{:?}] Connected to peer {:?} via n0 fallback {} (handshake task {:?}, candidate age {:?})",
@@ -1237,28 +1319,46 @@ impl GameNet {
             }
         });
 
-        (sender, receiver, dtt_reannounce, session_hash)
+        DiscoverySetup {
+            sender,
+            receiver,
+            dtt_reannounce,
+            bootstrap_session_hash: session_hash,
+        }
     }
 
-    pub async fn connect(
-        meta: GameMeta,
-        session_state: Arc<Mutex<SessionState>>,
-        connection_state: Arc<AtomicU8>,
-        encryption_enabled: bool,
-        discovery_mode: DiscoveryMode,
-        handshake_config: HandshakeConfig,
-        bootstrap_url: Option<String>,
-        bootstrap_relay_url: Option<iroh::RelayUrl>,
-        send_buf: Arc<Mutex<Vec<Vec<u8>>>>,
-        incoming_msgs_tx: UnboundedSender<Msg>,
-        crypter_key_rx: Option<UnboundedReceiver<CrypterUpdate>>,
-        gameevent_rx: UnboundedReceiver<DolphinEvent>,
-        handshake_succ_tx: Option<UnboundedSender<(u64, u64)>>,
-        session_cancel_token: CancellationToken,
-        timeouts: TimeoutConfig,
-        max_packet_length: usize,
-    ) {
-        let bootstrap_url = bootstrap_url.unwrap_or_else(|| DEFAULT_BOOTSTRAP_URL.to_string());
+    pub async fn connect(args: GameNetConnectArgs) {
+        let GameNetConnectArgs {
+            meta,
+            runtime,
+            config,
+            app_io,
+            dolphin_io,
+        } = args;
+        let SessionRuntime {
+            session_state,
+            connection_state,
+            session_cancel_token,
+            peer_handshook,
+        } = runtime;
+        let NetworkConfig {
+            encryption_enabled,
+            discovery_mode,
+            handshake_config,
+            bootstrap_url,
+            bootstrap_relay_url,
+            timeouts,
+            max_packet_length,
+        } = config;
+        let AppIo {
+            send_buf,
+            incoming_msgs_tx,
+        } = app_io;
+        let DolphinIo {
+            crypter_key_rx,
+            gameevent_rx,
+            handshake_succ_tx,
+        } = dolphin_io;
 
         let mut secret_seed = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut secret_seed);
@@ -1292,6 +1392,14 @@ impl GameNet {
             .spawn((*endpoint).clone());
         let slp_version = meta.slp_version;
         let discovery_cancel_token = CancellationToken::new();
+        {
+            let discovery_cancel_token = discovery_cancel_token.clone();
+            let session_cancel_token = session_cancel_token.clone();
+            tokio::spawn(async move {
+                session_cancel_token.cancelled().await;
+                discovery_cancel_token.cancel();
+            });
+        }
 
         let handshake_state = Arc::new(Mutex::new(HandshakeState::new(
             handshake_config,
@@ -1301,31 +1409,42 @@ impl GameNet {
         let (peer_connected_tx, mut peer_connected_rx) = tokio::sync::watch::channel(false);
 
         // Setup Discovery
-        let (gossip_send, gossip_recv, dtt_reannounce, bootstrap_session_hash) =
-            Self::setup_discovery(
-                &gametopicstr,
+        let discovery_setup = Self::setup_discovery(
+            DiscoveryConfig {
+                gametopic: gametopicstr.clone(),
                 secret_seed,
-                endpoint.clone(),
-                gossip.clone(),
                 slp_version,
-                handshake_state.clone(),
-                static_discovery.clone(),
-                discovery_mode.clone(),
-                bootstrap_url.clone(),
-                bootstrap_relay_url.clone(),
-                discovery_cancel_token.clone(),
-                timeouts.clone(),
-                peer_connected_tx.clone(),
-            )
-            .await;
+                discovery_mode: discovery_mode.clone(),
+                bootstrap_url: bootstrap_url.clone(),
+                bootstrap_relay_url: bootstrap_relay_url.clone(),
+                timeouts: timeouts.clone(),
+            },
+            DiscoveryRuntime {
+                endpoint: endpoint.clone(),
+                gossip: gossip.clone(),
+                handshake_state: handshake_state.clone(),
+                static_discovery: static_discovery.clone(),
+                discovery_cancel: discovery_cancel_token.clone(),
+                peer_connected_tx: peer_connected_tx.clone(),
+                peer_handshook: peer_handshook.clone(),
+            },
+        )
+        .await;
+        let DiscoverySetup {
+            sender: gossip_send,
+            receiver: gossip_recv,
+            dtt_reannounce,
+            bootstrap_session_hash,
+        } = discovery_setup;
 
-        let gossip_guard = HandshakeGuard::new(
-            gossip.clone(),
-            handshake_state.clone(),
+        let gossip_guard = HandshakeGuard::new(HandshakeGuardArgs {
+            gossip: gossip.clone(),
+            state: handshake_state.clone(),
             handshake_succ_tx,
-            discovery_cancel_token.clone(),
-            peer_connected_tx.clone(),
-        );
+            discovery_cancel: discovery_cancel_token.clone(),
+            peer_connected_tx: peer_connected_tx.clone(),
+            peer_handshook: peer_handshook.clone(),
+        });
 
         let router = iroh::protocol::Router::builder((*endpoint).clone())
             .accept(SSP_ALPN, gossip_guard)
@@ -1348,8 +1467,12 @@ impl GameNet {
         });
 
         let connection_state_for_task = connection_state.clone();
+        let peer_handshook_for_task = peer_handshook.clone();
         tokio::spawn(async move {
             loop {
+                if *peer_connected_rx.borrow() {
+                    peer_handshook_for_task.store(true, Ordering::Relaxed);
+                }
                 if *peer_connected_rx.borrow() && *gossip_joined_rx.borrow() {
                     connection_state_for_task
                         .store(ConnectionState::Discovered as u8, Ordering::Relaxed);
