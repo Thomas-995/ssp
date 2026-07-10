@@ -843,7 +843,6 @@ impl GameNet {
         let my_addr = endpoint.addr();
         let mut session_hash = get_hashed_seed(gametopicstr);
         let mut initial_peers = Vec::new();
-        let mut bootstrap_success = false;
 
         // Bootstrap Discovery
         if !discovery_cancel.is_cancelled() && discovery_mode != DiscoveryMode::DhtOnly {
@@ -878,7 +877,6 @@ impl GameNet {
                         for peer_addr in peers {
                             initial_peers.push((peer_addr, true));
                         }
-                        bootstrap_success = true;
                     }
                     Err(e) => {
                         debug_eprintln!(
@@ -903,7 +901,7 @@ impl GameNet {
         let dht_topic = DttTopicId::new(gametopicstr.to_string());
         let signing_key = SigningKey::from_bytes(&secret_seed);
 
-        let mut dht_rp = RecordPublisher::new(
+        let dht_rp = RecordPublisher::new(
             dht_topic.clone(),
             signing_key.verifying_key(),
             signing_key.clone(),
@@ -911,60 +909,10 @@ impl GameNet {
             session_hash.to_vec(),
         );
 
-        if !discovery_cancel.is_cancelled()
-            && (!bootstrap_success || initial_peers.is_empty())
-            && discovery_mode != DiscoveryMode::BootstrapOnly
-        {
-            debug_println!(
-                "[{:?}] Fetching peers from BitTorrent DHT",
-                setup_started_at.elapsed()
-            );
-            let minute = distributed_topic_tracker::unix_minute(0);
-            let content = DhtRecordContent {
-                id: *my_id.as_bytes(),
-                session_seed: session_hash,
-            };
-
-            // Publish our record so others can find us
-            if let Ok(record) = dht_rp.new_record(minute, content) {
-                if let Err(e) = dht_rp.publish_record(record).await {
-                    debug_eprintln!("DTT initial publish failed: {}", e);
-                }
-            }
-            debug_eprintln!("Published to DHT at minute={}", minute);
-
-            // Scan for existing records to find the session seed
-            let earliest_minute = minute.saturating_sub(8);
-            debug_eprintln!("Scanning DHT on minutes={}-{}", earliest_minute, minute);
-
-            let mut found_session_hash = None;
-            for m in (earliest_minute..=minute).rev() {
-                for record in dht_rp.get_records(m).await {
-                    if let Ok(content) = record.content::<DhtRecordContent>() {
-                        if let Ok(peer_id) = EndpointId::from_bytes(&content.id) {
-                            if peer_id != my_id {
-                                debug_eprintln!("Found peer {:?} on DHT at minute={}", peer_id, m);
-                                initial_peers.push((EndpointAddr::new(peer_id), false));
-                                if found_session_hash.is_none() {
-                                    found_session_hash = Some(content.session_seed);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(hash) = found_session_hash {
-                session_hash = hash;
-                dht_rp = RecordPublisher::new(
-                    dht_topic.clone(),
-                    signing_key.verifying_key(),
-                    signing_key.clone(),
-                    None,
-                    session_hash.to_vec(),
-                );
-            }
-        }
+        // Do not block setup on DHT scans. Subscribe/start accepting handshakes
+        // immediately after the bootstrap attempt; the background DHT task
+        // below publishes our record and scans for peers without delaying the
+        // gossip topic or incoming connections.
 
         // Subscribe to Gossip using the discovered session_seed
         let topic_id = TopicId::from_bytes(session_hash);
