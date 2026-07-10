@@ -1200,15 +1200,17 @@ impl GameNet {
                                 debug_eprintln!("Error handing connection to gossip: {e}");
                                 active_peers_for_task.lock().await.remove(&peer_id);
                             } else {
+                                peer_handshook_for_task.store(true, Ordering::Relaxed);
                                 if let Err(e) = join_sender_for_task.join_peers(vec![peer_id]).await
                                 {
                                     debug_eprintln!(
-                                        "Post-handshake join_peers failed for {:?}: {}",
+                                        "Post-handshake join_peers failed for {:?}: {}; will retry future candidates for this peer",
                                         peer_id,
                                         e
                                     );
+                                    active_peers_for_task.lock().await.remove(&peer_id);
+                                    return;
                                 }
-                                peer_handshook_for_task.store(true, Ordering::Relaxed);
                                 let _ = peer_connected_for_task.send(true);
                                 debug_println!(
                                     "[{:?}] Connected to peer {:?} (handshake task {:?}, candidate age {:?})",
@@ -1266,16 +1268,18 @@ impl GameNet {
                                                 "Error handing connection to gossip (fallback): {e}"
                                             );
                                         } else {
+                                            peer_handshook_for_task.store(true, Ordering::Relaxed);
                                             if let Err(e) =
                                                 join_sender_for_task.join_peers(vec![peer_id]).await
                                             {
                                                 debug_eprintln!(
-                                                    "Post-handshake join_peers failed for {:?} (fallback): {}",
+                                                    "Post-handshake join_peers failed for {:?} (fallback): {}; will retry future candidates for this peer",
                                                     peer_id,
                                                     e
                                                 );
+                                                active_peers_for_task.lock().await.remove(&peer_id);
+                                                return;
                                             }
-                                            peer_handshook_for_task.store(true, Ordering::Relaxed);
                                             let _ = peer_connected_for_task.send(true);
                                             debug_println!(
                                                 "[{:?}] Connected to peer {:?} via n0 fallback {} (handshake task {:?}, candidate age {:?})",
@@ -1466,14 +1470,26 @@ impl GameNet {
             GameNet::msg_consumer(gossip_recv, consumer_msg_buf_for_task).await;
         });
 
+        let initial_peer_seed_hash = *current_seed_hash.lock().await;
         let connection_state_for_task = connection_state.clone();
         let peer_handshook_for_task = peer_handshook.clone();
+        let initial_sender = gossip_send.clone();
+        let initial_secret_key = secret_key.clone();
+        let initial_from = endpoint.id();
         tokio::spawn(async move {
             loop {
                 if *peer_connected_rx.borrow() {
                     peer_handshook_for_task.store(true, Ordering::Relaxed);
                 }
                 if *peer_connected_rx.borrow() && *gossip_joined_rx.borrow() {
+                    let signed_msg = SLPMsg::new_signed(
+                        SLPMsgData::NewGame {
+                            from: initial_from,
+                            newseed: initial_peer_seed_hash,
+                        },
+                        &initial_secret_key,
+                    );
+                    let _ = initial_sender.broadcast(signed_msg.to_vec().into()).await;
                     connection_state_for_task
                         .store(ConnectionState::Discovered as u8, Ordering::Relaxed);
                     return;
@@ -1494,24 +1510,7 @@ impl GameNet {
             }
         });
 
-        let initial_peer_seed_hash = *current_seed_hash.lock().await;
         *session_state.lock().await = SessionState::InGame;
-
-        {
-            let initial_sender = gossip_send.clone();
-            let initial_secret_key = secret_key.clone();
-            let initial_from = endpoint.id();
-            tokio::spawn(async move {
-                let signed_msg = SLPMsg::new_signed(
-                    SLPMsgData::NewGame {
-                        from: initial_from,
-                        newseed: initial_peer_seed_hash,
-                    },
-                    &initial_secret_key,
-                );
-                let _ = initial_sender.broadcast(signed_msg.to_vec().into()).await;
-            });
-        }
 
         GameNet::state_loop(Self {
             session_state,
