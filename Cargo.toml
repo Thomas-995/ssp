@@ -1,5 +1,19 @@
+[package]
+name = "ssp-dev-stack"
+version = "0.1.0"
+edition = "2021"
+publish = false
+default-run = "ssp-dev-stack"
+
 [workspace]
+resolver = "2"
 members = [
+  ".",
   "ssp_client",
   "ssp_bootstrap",
 ]
+
+[dependencies]
+iroh-relay = { version = "0.95.0", features = ["server"] }
+ssp-bootstrap = { path = "ssp_bootstrap" }
+tokio = { version = "1", features = ["full"] }

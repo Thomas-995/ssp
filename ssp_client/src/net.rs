@@ -1,15 +1,18 @@
+#![cfg_attr(not(debug_assertions), allow(unused_variables))]
+
 use crate::crypter::CrypterUpdate;
 use crate::dolphin::{DolphinEvent, GameMeta};
 use crate::game::{
     ConnectionState, DiscoveryMode, SessionState, TimeoutConfig, DEFAULT_BOOTSTRAP_URL,
 };
-use crate::handshake::{self, HandshakeConfig, HandshakeGuard, HandshakeState, SSP_ALPN};
+use crate::handshake::{
+    self, HandshakeConfig, HandshakeGuard, HandshakeState, SSP_ALPN, SSP_VERSION,
+};
 use crate::msg::{Msg, MsgPayload, SLPMsg, SLPMsgData};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chacha20poly1305::aead::generic_array::GenericArray;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit};
-use core::future::Future;
 use debug_print::{debug_eprintln, debug_println};
 use iroh::{
     discovery::static_provider::StaticProvider, endpoint::Endpoint, EndpointAddr, EndpointId,
@@ -28,7 +31,7 @@ use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use distributed_topic_tracker::{GossipRecordContent, RecordPublisher, TopicId as DttTopicId};
+use distributed_topic_tracker::{RecordPublisher, TopicId as DttTopicId};
 use ed25519_dalek::SigningKey;
 
 struct ChunkAssembly {
@@ -60,6 +63,7 @@ struct DhtRecordContent {
 struct PeerCandidate {
     peer_addr: EndpointAddr,
     peer_id: EndpointId,
+    #[cfg(debug_assertions)]
     via_bootstrap: bool,
     discovered_at: tokio::time::Instant,
 }
@@ -77,6 +81,7 @@ fn decode_nodeid_response(encoded: &str) -> Result<[u8; 32], String> {
 
 pub struct GameNet {
     session_state: Arc<Mutex<SessionState>>,
+    connection_state: Arc<AtomicU8>,
     send_buf: Arc<Mutex<Vec<Vec<u8>>>>,
     incoming_msgs_tx: UnboundedSender<Msg>,
     consumer_msg_buf: Arc<Mutex<Vec<SLPMsg>>>,
@@ -108,44 +113,8 @@ impl GameNet {
         self.endpoint.id()
     }
 
-    pub fn broadcast(
-        &self,
-        msg: SLPMsgData,
-    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
-        let sender = self.send.clone();
-        let from = self.you();
-        let secret_key = self.secret_key.clone();
-        let max_packet_length = self.max_packet_length;
-
-        async move {
-            let signed_msg = SLPMsg::new_signed(msg, &secret_key);
-            let bytes = signed_msg.to_vec();
-
-            if bytes.len() <= max_packet_length {
-                return Ok(sender.broadcast(bytes.into()).await?);
-            }
-
-            // TODO: make sure is correct
-            let raw_chunk_size = max_packet_length - 0x20 * 2 - 0x04 * 2 - 0x10 - 64;
-            let chunks: Vec<&[u8]> = bytes.chunks(raw_chunk_size).collect();
-            let total = chunks.len() as u16;
-            let id: u64 = rand::random();
-            for (index, chunk) in chunks.iter().enumerate() {
-                let chunk_msg = SLPMsg::new_signed(
-                    SLPMsgData::Chunk {
-                        from,
-                        id,
-                        index: index as u16,
-                        total,
-                        payload: chunk.to_vec(),
-                    },
-                    &secret_key,
-                );
-                let chunk_bytes = chunk_msg.to_vec();
-                sender.broadcast(chunk_bytes.into()).await?;
-            }
-            Ok(())
-        }
+    fn peer_discovered(&self) -> bool {
+        self.connection_state.load(Ordering::Relaxed) == ConnectionState::Discovered as u8
     }
 
     fn poll_keys(&mut self) {
@@ -244,11 +213,6 @@ impl GameNet {
                     self.previous_key = None;
                     self.next_key = None;
                 }
-                DolphinEvent::Disconnected => {
-                    self.local_in_game = false;
-                    *self.session_state.lock().await = SessionState::Ended;
-                    self.session_cancel_token.cancel();
-                }
             }
         }
     }
@@ -310,7 +274,7 @@ impl GameNet {
 
     async fn pipe_outgoing(&mut self) {
         let current_hash = *self.current_seed_hash.lock().await;
-        if self.peer_seed_hash != Some(current_hash) {
+        if self.peer_seed_hash != Some(current_hash) || !self.peer_discovered() {
             return;
         }
 
@@ -445,10 +409,11 @@ impl GameNet {
     }
 
     async fn pipe_incoming(&mut self) {
+        let discovered = self.peer_discovered();
         if let Some(msg) = self
             .pop_first_msg(|m| {
-                matches!(m.body, SLPMsgData::Data { .. })
-                    || matches!(m.body, SLPMsgData::NewGame { .. })
+                matches!(m.body, SLPMsgData::NewGame { .. })
+                    || (discovered && matches!(m.body, SLPMsgData::Data { .. }))
             })
             .await
         {
@@ -476,7 +441,7 @@ impl GameNet {
                         }
                     }
                 }
-                SLPMsgData::NewGame { from, newseed } => {
+                SLPMsgData::NewGame { from: _, newseed } => {
                     debug_println!("Received peer NewGame");
                     let current_hash = *self.current_seed_hash.lock().await;
                     if newseed != current_hash {
@@ -602,6 +567,7 @@ impl GameNet {
         None
     }
 
+    #[cfg(debug_assertions)]
     fn endpoint_addr_summary(addr: &EndpointAddr) -> String {
         format!("{:?}", addr)
     }
@@ -867,7 +833,7 @@ impl GameNet {
             session_hash.to_vec(),
         );
 
-        if !bootstrap_success && discovery != DiscoveryMode::BootstrapOnly {
+        if (!bootstrap_success || initial_peers.is_empty()) && discovery != DiscoveryMode::BootstrapOnly {
             debug_println!(
                 "[{:?}] Fetching peers from BitTorrent DHT",
                 setup_started_at.elapsed()
@@ -953,6 +919,7 @@ impl GameNet {
             let _ = candidate_tx.send(PeerCandidate {
                 peer_addr,
                 peer_id,
+                #[cfg(debug_assertions)]
                 via_bootstrap,
                 discovered_at: tokio::time::Instant::now(),
             });
@@ -1013,6 +980,7 @@ impl GameNet {
                                     let _ = tx_clone.send(PeerCandidate {
                                         peer_addr,
                                         peer_id,
+                                        #[cfg(debug_assertions)]
                                         via_bootstrap: true,
                                         discovered_at: tokio::time::Instant::now(),
                                     });
@@ -1061,6 +1029,7 @@ impl GameNet {
                                             let _ = tx_clone.send(PeerCandidate {
                                                 peer_addr: EndpointAddr::new(peer_id),
                                                 peer_id,
+                                                #[cfg(debug_assertions)]
                                                 via_bootstrap: false,
                                                 discovered_at: tokio::time::Instant::now(),
                                             });
@@ -1083,12 +1052,15 @@ impl GameNet {
         let peer_connected_on_connect = peer_connected_tx.clone();
 
         tokio::spawn(async move {
-            let mut seen_peers = std::collections::HashSet::new();
+            let active_peers: Arc<Mutex<HashSet<EndpointId>>> = Arc::new(Mutex::new(HashSet::new()));
             let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             while let Some(candidate) = candidate_rx.recv().await {
-                if !seen_peers.insert(candidate.peer_id) {
-                    continue;
+                {
+                    let mut active = active_peers.lock().await;
+                    if !active.insert(candidate.peer_id) {
+                        continue;
+                    }
                 }
 
                 debug_println!(
@@ -1111,6 +1083,7 @@ impl GameNet {
                 let join_sender_for_task = join_sender.clone();
                 let cancel_task = cancel_on_connect.clone();
                 let failed_peers_for_task = failed_peers.clone();
+                let active_peers_for_task = active_peers.clone();
                 let peer_connected_for_task = peer_connected_on_connect.clone();
 
                 let handle = tokio::spawn(async move {
@@ -1135,12 +1108,14 @@ impl GameNet {
                         peer.clone(),
                         hs_for_task.clone(),
                         slp_version_task,
+                        SSP_VERSION,
                     )
                     .await
                     {
                         Ok(conn) => {
                             if let Err(e) = gossip_for_task.handle_connection(conn).await {
                                 debug_eprintln!("Error handing connection to gossip: {e}");
+                                active_peers_for_task.lock().await.remove(&peer_id);
                             } else {
                                 if let Err(e) = join_sender_for_task.join_peers(vec![peer_id]).await
                                 {
@@ -1159,16 +1134,18 @@ impl GameNet {
                                     candidate_discovered_at.elapsed()
                                 );
                                 cancel_task.cancel();
+                                active_peers_for_task.lock().await.remove(&peer_id);
                             }
                         }
                         Err(e) => {
                             if relay_task.is_none() {
-                                failed_peers_for_task.lock().await.insert(peer_id);
+                                let _ = failed_peers_for_task;
                                 debug_eprintln!(
-                                    "Handshake failed for {:?}: {}; ignoring future candidates for this peer",
+                                    "Handshake failed for {:?}: {}; will retry future candidates for this peer",
                                     peer_id,
                                     e
                                 );
+                                active_peers_for_task.lock().await.remove(&peer_id);
                                 return;
                             }
 
@@ -1180,7 +1157,6 @@ impl GameNet {
 
                             let n0_relays =
                                 iroh::defaults::prod::default_relay_map().urls::<Vec<_>>();
-                            let mut last_fallback_err = None;
                             for n0_relay in n0_relays {
                                 debug_println!(
                                     "Trying n0 fallback relay {} for {:?}",
@@ -1194,6 +1170,7 @@ impl GameNet {
                                     fallback_peer,
                                     hs_for_task.clone(),
                                     slp_version_task,
+                                    SSP_VERSION,
                                 )
                                 .await
                                 {
@@ -1224,6 +1201,7 @@ impl GameNet {
                                                 candidate_discovered_at.elapsed()
                                             );
                                             cancel_task.cancel();
+                                            active_peers_for_task.lock().await.remove(&peer_id);
                                             return;
                                         }
                                     }
@@ -1234,16 +1212,15 @@ impl GameNet {
                                             peer_id,
                                             fallback_err
                                         );
-                                        last_fallback_err = Some(fallback_err);
                                     }
                                 }
                             }
 
-                            failed_peers_for_task.lock().await.insert(peer_id);
+                            let _ = failed_peers_for_task;
+                            active_peers_for_task.lock().await.remove(&peer_id);
                             debug_eprintln!(
-                                "All n0 fallback handshakes failed for {:?}: {}; ignoring future candidates for this peer",
+                                "All n0 fallback handshakes failed for {:?}; will retry future candidates",
                                 peer_id,
-                                last_fallback_err.unwrap_or_else(|| "no n0 relays configured".to_string())
                             );
                         }
                     }
@@ -1316,6 +1293,7 @@ impl GameNet {
         let handshake_state = Arc::new(Mutex::new(HandshakeState::new(
             handshake_config,
             slp_version,
+            SSP_VERSION,
         )));
         let (peer_connected_tx, mut peer_connected_rx) = tokio::sync::watch::channel(false);
 
@@ -1395,6 +1373,7 @@ impl GameNet {
 
         GameNet::state_loop(Self {
             session_state,
+            connection_state,
             send_buf,
             incoming_msgs_tx,
             consumer_msg_buf,

@@ -14,7 +14,7 @@ Debug builds can override defaults with:
 SSP_DOLPHIN_HOST=127.0.0.1 \
 SSP_DOLPHIN_PORT=51441 \
 SSP_BOOTSTRAP_URL=http://127.0.0.1:5000 \
-SSP_RELAY_URL=http://127.0.0.1:3340 \
+SSP_RELAY_URL=http://127.0.0.1:11015 \
 cargo run -p ssp-client --bin ssp
 ```
 

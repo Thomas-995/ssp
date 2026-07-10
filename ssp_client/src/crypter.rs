@@ -1,5 +1,5 @@
 use crate::dolphin::{GameMeta, InputFrame};
-use debug_print::{debug_eprintln, debug_println};
+use debug_print::debug_println;
 use sha3::{
     digest::{ExtendableOutput, Update, XofReader},
     Shake256,
@@ -10,7 +10,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 #[derive(Clone, Copy, Debug)]
 pub struct GameKey {
-    pub frames: u64,
     pub key: [u8; 32],
 }
 
@@ -140,10 +139,7 @@ impl SLPcrypter {
         let mut xof = working.finalize_xof();
         let mut key = [0u8; 32];
         xof.read(&mut key);
-        Some(GameKey {
-            frames: self.sponge.frames,
-            key,
-        })
+        Some(GameKey { key })
     }
 
     pub async fn start(mut self) {

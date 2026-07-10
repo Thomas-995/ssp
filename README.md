@@ -58,3 +58,6 @@ async fn main() -> std::io::Result<()> {
     BootstrapServer::new(ServerConfig::default()).run().await
 }
 ```
+
+
+TODO: should handshake on whether to even use encryption

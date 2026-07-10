@@ -2,7 +2,7 @@
 
 use crate::crypter::{CrypterInput, CrypterUpdate, SLPcrypter};
 use crate::dolphin::{DolphinEvent, SLPreader};
-use crate::handshake::{HandshakeConfig, ParamRange};
+use crate::handshake::{HandshakeConfig, ParamRange, SSP_VERSION};
 use crate::msg::Msg;
 use crate::net::GameNet;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -159,8 +159,8 @@ impl Session {
     }
 }
 
-pub(crate) const DEFAULT_RELAY_URL: &str = "http://slippi-ssp.net:3340";
-pub(crate) const DEFAULT_BOOTSTRAP_URL: &str = "http://slippi-ssp.net:5000";
+pub(crate) const DEFAULT_RELAY_URL: &str = "http://slippi-ssp.net:11015";
+pub(crate) const DEFAULT_BOOTSTRAP_URL: &str = "http://slippi-ssp.net:11008";
 
 /// Builder for configuring and starting a [`Session`].
 pub struct SessionBuilder {
@@ -190,6 +190,8 @@ impl SessionBuilder {
                 offset: ParamRange::new(30, 60, 120),
                 slp_version_min: [0, 0, 0],
                 slp_version_max: [u8::MAX, u8::MAX, u8::MAX],
+                ssp_version_min: SSP_VERSION,
+                ssp_version_max: SSP_VERSION,
             },
             bootstrap_url: None,
             relay_url: None,
@@ -218,13 +220,13 @@ impl SessionBuilder {
     }
 
     /// Set URL for bootstrap server (if bootstrap [`DiscoveryMode`] enabled, default:
-    /// http://slippi-ssp.net:5000)
+    /// http://slippi-ssp.net:11008)
     pub fn set_bootstrap_url(mut self, url: &str) -> Self {
         self.bootstrap_url = Some(url.trim_end_matches('/').to_string());
         self
     }
 
-    /// Set URL for the iroh relay server (default: http://slippi-ssp.net:3340).
+    /// Set URL for the iroh relay server (default: http://slippi-ssp.net:11015).
     pub fn set_relay_url(mut self, url: &str) -> Self {
         self.relay_url = Some(url.trim_end_matches('/').to_string());
         self
@@ -258,6 +260,14 @@ impl SessionBuilder {
     pub fn set_slp_version_filter(mut self, min: [u8; 3], max: [u8; 3]) -> Self {
         self.handshake_config.slp_version_min = min;
         self.handshake_config.slp_version_max = max;
+        self
+    }
+
+    /// Set the acceptable SSP protocol version range (default: 0.0.0 to SSP_VERSION).
+    /// Both sides must agree; handshake is rejected if versions don't overlap.
+    pub fn set_ssp_version_range(mut self, min: [u8; 3], max: [u8; 3]) -> Self {
+        self.handshake_config.ssp_version_min = min;
+        self.handshake_config.ssp_version_max = max;
         self
     }
 

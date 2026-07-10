@@ -1,15 +1,19 @@
-use std::collections::{HashMap, HashSet};
+#![cfg_attr(not(debug_assertions), allow(unused_variables))]
+
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use iroh::endpoint::{Accepting, Connection};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::EndpointId;
 use iroh_gossip::net::Gossip;
 
-use debug_print::{debug_eprint, debug_eprintln, debug_print, debug_println};
+use debug_print::{debug_eprintln, debug_println};
 use serde::{Deserialize, Serialize};
+
+/// Current SSP protocol version. Incremented when breaking handshake/network
+/// changes are made that old peers should not interoperate with.
+pub const SSP_VERSION: [u8; 3] = [0, 1, 0];
 
 // Min/preferred/max for handshake parameters
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,6 +57,8 @@ pub struct HandshakeConfig {
     pub offset: ParamRange,
     pub slp_version_min: [u8; 3],
     pub slp_version_max: [u8; 3],
+    pub ssp_version_min: [u8; 3],
+    pub ssp_version_max: [u8; 3],
 }
 
 // Sent by joiner
@@ -60,6 +66,7 @@ pub struct HandshakeConfig {
 pub struct HandshakeOffer {
     pub config: HandshakeConfig,
     pub slp_version: [u8; 3],
+    pub ssp_version: [u8; 3],
 }
 
 // Sent by host when offer is accepted
@@ -91,6 +98,7 @@ pub struct HandshakeState {
     pub config: HandshakeConfig,
     // Not in config as out of application control
     pub slp_version: [u8; 3],
+    pub ssp_version: [u8; 3],
 
     // Valid parameter ranges for self and peers,
     // preferred is active value, only narrows
@@ -100,10 +108,11 @@ pub struct HandshakeState {
 }
 
 impl HandshakeState {
-    pub fn new(config: HandshakeConfig, slp_version: [u8; 3]) -> Self {
+    pub fn new(config: HandshakeConfig, slp_version: [u8; 3], ssp_version: [u8; 3]) -> Self {
         Self {
             config,
             slp_version,
+            ssp_version,
             group_rollover: config.rollover,
             group_offset: config.offset,
         }
@@ -111,6 +120,40 @@ impl HandshakeState {
 
     // Evaluate incoming HandshakeOffer and update connection parameters
     pub fn evaluate_offer(&mut self, offer: HandshakeOffer) -> Result<HandshakeAccept, String> {
+        // Check SSP protocol version compatibility (own version must fall in peer's range)
+        let their_ssp_min = offer.config.ssp_version_min;
+        let their_ssp_max = offer.config.ssp_version_max;
+        if self.ssp_version < their_ssp_min || self.ssp_version > their_ssp_max {
+            return Err(format!(
+                "Your SSP version {}.{}.{} outside peer's accepted range [{}.{}.{}, {}.{}.{}]",
+                self.ssp_version[0],
+                self.ssp_version[1],
+                self.ssp_version[2],
+                their_ssp_min[0],
+                their_ssp_min[1],
+                their_ssp_min[2],
+                their_ssp_max[0],
+                their_ssp_max[1],
+                their_ssp_max[2],
+            ));
+        }
+        // Check peer's SSP version falls in our accepted range
+        let my_ssp_min = self.config.ssp_version_min;
+        let my_ssp_max = self.config.ssp_version_max;
+        if offer.ssp_version < my_ssp_min || offer.ssp_version > my_ssp_max {
+            return Err(format!(
+                "Peer SSP version {}.{}.{} outside your accepted range [{}.{}.{}, {}.{}.{}]",
+                offer.ssp_version[0],
+                offer.ssp_version[1],
+                offer.ssp_version[2],
+                my_ssp_min[0],
+                my_ssp_min[1],
+                my_ssp_min[2],
+                my_ssp_max[0],
+                my_ssp_max[1],
+                my_ssp_max[2],
+            ));
+        }
         let my_min = self.config.slp_version_min;
         let my_max = self.config.slp_version_max;
         if offer.slp_version < my_min || offer.slp_version > my_max {
@@ -287,13 +330,16 @@ impl ProtocolHandler for HandshakeGuard {
             })?;
 
             debug_println!(
-                "{:?}: Offer for rollover={:?}, offset={:?}, slp_version={}.{}.{}",
+                "{:?}: Offer for rollover={:?}, offset={:?}, slp_version={}.{}.{}, ssp_version={}.{}.{}",
                 remote,
                 offer.config.rollover,
                 offer.config.offset,
                 offer.slp_version[0],
                 offer.slp_version[1],
                 offer.slp_version[2],
+                offer.ssp_version[0],
+                offer.ssp_version[1],
+                offer.ssp_version[2],
             );
 
             let (response, config_changed) = {
@@ -376,6 +422,7 @@ pub async fn perform_handshake(
     peer: impl Into<iroh::EndpointAddr>,
     state: Arc<Mutex<HandshakeState>>,
     slp_version: [u8; 3],
+    ssp_version: [u8; 3],
 ) -> Result<iroh::endpoint::Connection, String> {
     let peer_addr: iroh::EndpointAddr = peer.into();
     let peer_id = peer_addr.id;
@@ -407,6 +454,7 @@ pub async fn perform_handshake(
     let offer = HandshakeOffer {
         config: hs.config,
         slp_version,
+        ssp_version,
     };
     let offer_bytes = serde_json::to_vec(&offer).map_err(|e| format!("serialize offer: {e}"))?;
     send.write_all(&offer_bytes)
@@ -508,9 +556,12 @@ mod tests {
                 },
                 "slp_version_min": [0, 0, 0],
                 "slp_version_max": [255, 255, 255],
+                "ssp_version_min": [0, 0, 0],
+                "ssp_version_max": [255, 255, 255],
                 "future_config_field": "ignored"
             },
             "slp_version": [3, 19, 0],
+            "ssp_version": [0, 1, 0],
             "future_offer_field": {
                 "nested": "ignored"
             }
@@ -519,7 +570,10 @@ mod tests {
 
         assert_eq!(offer.config.rollover.preferred, 120);
         assert_eq!(offer.config.offset.preferred, 60);
+        assert_eq!(offer.config.ssp_version_min, [0, 0, 0]);
+        assert_eq!(offer.config.ssp_version_max, [255, 255, 255]);
         assert_eq!(offer.slp_version, [3, 19, 0]);
+        assert_eq!(offer.ssp_version, [0, 1, 0]);
     }
 
     #[test]

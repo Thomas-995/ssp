@@ -2,7 +2,7 @@
 name = "ssp-bootstrap"
 version = "0.1.0"
 edition = "2021"
-description = "Bootstrap peer-discovery server for SSP (Slippi Secured Protocol)"
+description = "Bootstrap peer-discovery server for SSP (Slippi Session Protocol)"
 readme = "README.md"
 license = "MIT"
 

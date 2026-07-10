@@ -1,15 +1,16 @@
+#![cfg_attr(not(debug_assertions), allow(unused_variables))]
+
 use crate::crypter::CrypterInput;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
-use std::sync::mpsc;
 use std::time::Duration;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
-use debug_print::{debug_eprint, debug_eprintln, debug_print, debug_println};
+use debug_print::{debug_eprintln, debug_println};
 use enet::{Address, BandwidthLimit, ChannelLimit, Enet, Event, Packet, PacketMode};
 use rand::random;
 use serde::Serialize;
@@ -20,20 +21,11 @@ use std::sync::OnceLock;
 pub struct PlayerMeta {
     pub port: u8,
     pub char: u8,
-    pub color: u8,
-    pub team: u8,
-    pub cpu: bool,
 }
 
 impl PlayerMeta {
-    pub fn new(port: u8, char: u8, color: u8, team: u8, cpu: bool) -> PlayerMeta {
-        Self {
-            port,
-            char,
-            color,
-            team,
-            cpu,
-        }
+    pub fn new(port: u8, char: u8) -> PlayerMeta {
+        Self { port, char }
     }
 }
 
@@ -62,7 +54,6 @@ impl GameMeta {
 pub enum DolphinEvent {
     NewGame(GameMeta),
     GameEnd,
-    Disconnected,
 }
 
 #[repr(u8)]
@@ -77,10 +68,6 @@ enum SLPEventType {
     FrameStart = 0x3a,
     ItemUpdate = 0x3b,
     FrameBookend = 0x3c,
-}
-enum SLPEvent {
-    NewGame(GameMeta),
-    GameEnd,
 }
 
 impl SLPEventType {
@@ -326,17 +313,13 @@ impl SLPreader {
                                                                                     let team_off = 0x6E + 0x24 * (player_index as usize);
                                                                                     let type_off = 0x66 + 0x24 * (player_index as usize);
 
-                                                                                    let color = eb.get(costume_off).copied();
-                                                                                    let team = eb.get(team_off).copied();
-                                                                                    let player_type = eb.get(type_off).copied();
-                                                                                    let is_cpu = player_type.map(|v| v != 1);
+                                                                                    let _ = eb.get(costume_off);
+                                                                                    let _ = eb.get(team_off);
+                                                                                    let _ = eb.get(type_off);
 
                                                                                     meta.players.push(PlayerMeta::new(
                                                                                         player_index + 1,
                                                                                         u8::MAX,
-                                                                                        color.unwrap_or(0),
-                                                                                        team.unwrap_or(0),
-                                                                                        is_cpu.unwrap_or(false),
                                                                                     ));
                                                                                 }
                                                                             }

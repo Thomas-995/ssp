@@ -1,6 +1,12 @@
 [package]
 name = "ssp-client"
+version = "0.1.0"
 edition = "2021"
+publish = true
+description = "Client library for SSP, a Slippi session protocol"
+readme = "README.md"
+repository = "https://github.com/Thomas-995/ssp"
+license = "MIT"
 
 [dependencies]
 arrow2 = { version = "0.17", features = ["io_ipc", "io_ipc_compression", "io_json"] }
