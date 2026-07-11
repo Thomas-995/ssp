@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 /// changes are made that old peers should not interoperate with.
 pub const SSP_VERSION: [u8; 3] = [0, 1, 0];
 
+fn default_true() -> bool {
+    true
+}
+
 // Min/preferred/max for handshake parameters
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParamRange {
@@ -60,6 +64,17 @@ pub struct HandshakeConfig {
     pub slp_version_max: [u8; 3],
     pub ssp_version_min: [u8; 3],
     pub ssp_version_max: [u8; 3],
+    /// Whether this endpoint will send encrypted app data.
+    /// Defaults to true for compatibility with pre-field clients, whose default
+    /// behavior was encrypted app data.
+    #[serde(default = "default_true")]
+    pub encryption_enabled: bool,
+    /// Whether this endpoint is willing to accept encrypted peers.
+    #[serde(default = "default_true")]
+    pub accept_encrypted: bool,
+    /// Whether this endpoint is willing to accept unencrypted peers.
+    #[serde(default)]
+    pub accept_unencrypted: bool,
 }
 
 // Sent by joiner
@@ -75,6 +90,9 @@ pub struct HandshakeOffer {
 pub struct HandshakeAccept {
     pub rollover: ParamRange,
     pub offset: ParamRange,
+    /// The accepted peer's app-data encryption mode.
+    #[serde(default = "default_true")]
+    pub encryption_enabled: bool,
 }
 
 // Sent by host when offer is rejected
@@ -106,6 +124,10 @@ pub struct HandshakeState {
     // and does not expand upon leaving peers
     pub group_rollover: ParamRange,
     pub group_offset: ParamRange,
+
+    // If we accepted both encrypted and unencrypted peers, the first peer
+    // we accept locks the session mode so all peers match.
+    pub encryption_locked: Option<bool>,
 }
 
 impl HandshakeState {
@@ -116,6 +138,7 @@ impl HandshakeState {
             ssp_version,
             group_rollover: config.rollover,
             group_offset: config.offset,
+            encryption_locked: None,
         }
     }
 
@@ -189,6 +212,37 @@ impl HandshakeState {
             ));
         }
 
+        let peer_encryption = offer.config.encryption_enabled;
+        if peer_encryption && !self.config.accept_encrypted {
+            return Err("encrypted peers are not accepted by local policy".to_string());
+        }
+        if !peer_encryption && !self.config.accept_unencrypted {
+            return Err("unencrypted peers are not accepted by local policy".to_string());
+        }
+
+        // If we are already locked to a mode by a previous peer in this session, enforce it.
+        // Otherwise, lock to the first peer's mode.
+        if let Some(locked) = self.encryption_locked {
+            if peer_encryption != locked {
+                return Err(
+                    "mixed encrypted/unencrypted app-data sessions are not supported".to_string(),
+                );
+            }
+        } else {
+            self.encryption_locked = Some(peer_encryption);
+        }
+
+        // Also update our own config to match the locked mode so we advertise correctly
+        // on any subsequent outgoing handshaking attempts.
+        self.config.encryption_enabled = peer_encryption;
+
+        if self.config.encryption_enabled && !offer.config.accept_encrypted {
+            return Err("peer does not accept encrypted connections".to_string());
+        }
+        if !self.config.encryption_enabled && !offer.config.accept_unencrypted {
+            return Err("peer does not accept unencrypted connections".to_string());
+        }
+
         // Narrow connection parameters
         let new_group_rollover = self
             .group_rollover
@@ -220,6 +274,7 @@ impl HandshakeState {
         Ok(HandshakeAccept {
             rollover: self.group_rollover,
             offset: self.group_offset,
+            encryption_enabled: self.config.encryption_enabled,
         })
     }
 }
@@ -263,16 +318,31 @@ impl HandshakeGuard {
         }
     }
 }
-pub fn accept_is_valid(config: HandshakeConfig, accept: &HandshakeAccept) -> bool {
+pub fn accept_is_valid(
+    config: HandshakeConfig,
+    accept: &HandshakeAccept,
+    locked_mode: Option<bool>,
+) -> Result<(), String> {
     if accept.offset.preferred > config.offset.max || accept.offset.preferred < config.offset.min {
-        return false;
+        return Err("offset outside range".to_string());
     }
     if accept.rollover.preferred > config.rollover.max
         || accept.rollover.preferred < config.rollover.min
     {
-        return false;
+        return Err("rollover outside range".to_string());
     }
-    true
+    if let Some(locked) = locked_mode {
+        if accept.encryption_enabled != locked {
+            return Err("mixed encrypted/unencrypted app-data sessions not supported".to_string());
+        }
+    }
+    if accept.encryption_enabled && !config.accept_encrypted {
+        return Err("peer requires encryption but local policy rejects it".to_string());
+    }
+    if !accept.encryption_enabled && !config.accept_unencrypted {
+        return Err("peer requires unencrypted but local policy rejects it".to_string());
+    }
+    Ok(())
 }
 
 impl ProtocolHandler for HandshakeGuard {
@@ -283,28 +353,14 @@ impl ProtocolHandler for HandshakeGuard {
         let state = self.state.clone();
         let handshake_succ_tx = self.handshake_succ_tx.clone();
         async move {
-            let accept_started_at = tokio::time::Instant::now();
             let conn = accepting.await?;
             let remote = conn.remote_id();
-
-            debug_println!(
-                "{:?}: Incoming handshake (accept elapsed {:?})",
-                remote,
-                accept_started_at.elapsed()
-            );
 
             let bi_res =
                 tokio::time::timeout(std::time::Duration::from_secs(6), conn.accept_bi()).await;
 
             let (mut send, mut recv) = match bi_res {
-                Ok(Ok(streams)) => {
-                    debug_println!(
-                        "{:?}: Accepted incoming bi stream after {:?}",
-                        remote,
-                        accept_started_at.elapsed()
-                    );
-                    streams
-                }
+                Ok(Ok(streams)) => streams,
                 Ok(Err(e)) => {
                     return Err(AcceptError::from_err(e));
                 }
@@ -321,12 +377,6 @@ impl ProtocolHandler for HandshakeGuard {
                 .read_to_end(MAX_HANDSHAKE_MSG)
                 .await
                 .map_err(AcceptError::from_err)?;
-            debug_println!(
-                "{:?}: Read handshake offer after {:?} ({} bytes)",
-                remote,
-                accept_started_at.elapsed(),
-                offer_bytes.len()
-            );
 
             let offer: HandshakeOffer = serde_json::from_slice(&offer_bytes).map_err(|e| {
                 AcceptError::from_err(std::io::Error::new(
@@ -334,19 +384,6 @@ impl ProtocolHandler for HandshakeGuard {
                     format!("invalid handshake offer: {e}"),
                 ))
             })?;
-
-            debug_println!(
-                "{:?}: Offer for rollover={:?}, offset={:?}, slp_version={}.{}.{}, ssp_version={}.{}.{}",
-                remote,
-                offer.config.rollover,
-                offer.config.offset,
-                offer.slp_version[0],
-                offer.slp_version[1],
-                offer.slp_version[2],
-                offer.ssp_version[0],
-                offer.ssp_version[1],
-                offer.ssp_version[2],
-            );
 
             let (response, config_changed) = {
                 let mut hs = state.lock().await;
@@ -376,22 +413,9 @@ impl ProtocolHandler for HandshakeGuard {
                 .await
                 .map_err(AcceptError::from_err)?;
             send.finish().map_err(AcceptError::from_err)?;
-            debug_println!(
-                "{:?}: Sent handshake response after {:?} ({} bytes)",
-                remote,
-                accept_started_at.elapsed(),
-                resp_bytes.len()
-            );
 
             match &response {
                 HandshakeResponse::Accept(accept) => {
-                    debug_println!(
-                        "{:?}: Accepted with active rollover={}, offset={} (total incoming handshake {:?})",
-                        remote,
-                        accept.rollover.preferred,
-                        accept.offset.preferred,
-                        accept_started_at.elapsed()
-                    );
                     if config_changed {
                         if let Some(ref tx) = handshake_succ_tx {
                             let _ = tx.send((accept.rollover.preferred, accept.offset.preferred));
@@ -434,33 +458,24 @@ pub async fn perform_handshake(
 ) -> Result<iroh::endpoint::Connection, String> {
     let peer_addr: iroh::EndpointAddr = peer.into();
     let peer_id = peer_addr.id;
-    let handshake_started_at = tokio::time::Instant::now();
-    debug_println!("{:?}: Initiating handshake...", peer_id);
 
     let conn = endpoint
         .connect(peer_addr, SSP_ALPN)
         .await
         .map_err(|e| format!("handshake connect failed: {e}"))?;
-    debug_println!(
-        "{:?}: Endpoint connect completed after {:?}",
-        peer_id,
-        handshake_started_at.elapsed()
-    );
 
     let (mut send, mut recv) = conn
         .open_bi()
         .await
         .map_err(|e| format!("handshake open_bi failed: {e}"))?;
-    debug_println!(
-        "{:?}: Opened handshake bi stream after {:?}",
-        peer_id,
-        handshake_started_at.elapsed()
-    );
 
-    // Send our offer
-    let mut hs = state.lock().await;
+    let (hs_config, locked) = {
+        let hs = state.lock().await;
+        (hs.config, hs.encryption_locked)
+    };
+
     let offer = HandshakeOffer {
-        config: hs.config,
+        config: hs_config,
         slp_version,
         ssp_version,
     };
@@ -471,40 +486,27 @@ pub async fn perform_handshake(
     send.finish()
         .map_err(|e| format!("handshake finish failed: {e}"))?;
 
-    debug_println!(
-        "{:?}: Was sent our handshake offer after {:?} ({} bytes)",
-        peer_id,
-        handshake_started_at.elapsed(),
-        offer_bytes.len()
-    );
-
     // Read response to offer
     let resp_bytes = recv
         .read_to_end(MAX_HANDSHAKE_MSG)
         .await
         .map_err(|e| format!("handshake read failed: {e}"))?;
-    debug_println!(
-        "{:?}: Read handshake response after {:?} ({} bytes)",
-        peer_id,
-        handshake_started_at.elapsed(),
-        resp_bytes.len()
-    );
 
     let response: HandshakeResponse =
         serde_json::from_slice(&resp_bytes).map_err(|e| format!("parse response: {e}"))?;
 
     match response {
         HandshakeResponse::Accept(accept) => {
-            debug_println!(
-                "{:?}: Accepted handshake for rollover={}, offset={} (total outgoing handshake {:?})",
-                peer_id,
-                accept.rollover.preferred,
-                accept.offset.preferred,
-                handshake_started_at.elapsed()
-            );
-            if !accept_is_valid(hs.config, &accept) {
-                return Err("Peer returned invalid connection configuration".to_string());
+            if let Err(e) = accept_is_valid(hs_config, &accept, locked) {
+                return Err(format!(
+                    "Peer returned invalid connection configuration: {e}"
+                ));
             }
+
+            let mut hs = state.lock().await;
+            hs.encryption_locked = Some(accept.encryption_enabled);
+            hs.config.encryption_enabled = accept.encryption_enabled;
+
             // Narrow parameters, should be contained by our config but intersect for bad response
             hs.config.rollover =
                 accept

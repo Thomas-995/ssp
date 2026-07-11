@@ -2,7 +2,7 @@
 
 use crate::crypter::{CrypterInput, CrypterUpdate, SLPcrypter};
 use crate::dolphin::{DolphinEvent, GameMeta, SLPreader};
-use crate::handshake::{HandshakeConfig, ParamRange, SSP_VERSION};
+use crate::handshake::{HandshakeConfig, ParamRange, HandshakeState, SSP_VERSION};
 use crate::msg::Msg;
 use crate::net::{AppIo, DolphinIo, GameNet, GameNetConnectArgs, NetworkConfig, SessionRuntime};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -196,6 +196,9 @@ impl SessionBuilder {
                 slp_version_max: [u8::MAX, u8::MAX, u8::MAX],
                 ssp_version_min: SSP_VERSION,
                 ssp_version_max: SSP_VERSION,
+                encryption_enabled: true,
+                accept_encrypted: true,
+                accept_unencrypted: false,
             },
             bootstrap_url: None,
             relay_url: None,
@@ -218,8 +221,29 @@ impl SessionBuilder {
     }
 
     /// Enable or disable input-based encryption (default: enabled).
+    ///
+    /// By default this also makes the handshake accept only peers using the
+    /// same encryption mode. Override that policy with
+    /// [`SessionBuilder::set_encryption_acceptance`].
     pub fn set_encryption(mut self, enabled: bool) -> Self {
         self.encryption_enabled = enabled;
+        self.handshake_config.encryption_enabled = enabled;
+        self.handshake_config.accept_encrypted = enabled;
+        self.handshake_config.accept_unencrypted = !enabled;
+        self
+    }
+
+    /// Configure which peer encryption modes are accepted during handshake.
+    ///
+    /// Mixed encrypted/unencrypted data sessions are currently rejected even if
+    /// both flags are true, because app-data encryption is session-wide.
+    pub fn set_encryption_acceptance(
+        mut self,
+        accept_encrypted: bool,
+        accept_unencrypted: bool,
+    ) -> Self {
+        self.handshake_config.accept_encrypted = accept_encrypted;
+        self.handshake_config.accept_unencrypted = accept_unencrypted;
         self
     }
 
@@ -306,24 +330,37 @@ impl SessionBuilder {
 
         let handshake_config = self.handshake_config;
 
-        // If encryption enabled, setup crypter with gameinfo (input) and key update (output) channels
-        let (crypter_key_rx, crypter_input_tx, handshake_succ_tx) = if self.encryption_enabled {
-            let (update_tx, update_rx) = unbounded_channel::<CrypterUpdate>();
-            let (input_tx, input_rx) = unbounded_channel::<CrypterInput>();
-            let (handshake_succ_tx, handshake_succ_rx) = unbounded_channel::<(u64, u64)>();
+        let (encryption_enabled, crypter_key_rx, crypter_input_tx, handshake_succ_tx) = {
+            let mut enabled = self.encryption_enabled;
+            if enabled
+                && !self.handshake_config.accept_unencrypted
+                && !self.handshake_config.accept_encrypted
+            {
+                enabled = false;
+            }
+            if enabled {
+                let (update_tx, update_rx) = unbounded_channel::<CrypterUpdate>();
+                let (input_tx, input_rx) = unbounded_channel::<CrypterInput>();
+                let (handshake_succ_tx, handshake_succ_rx) = unbounded_channel::<(u64, u64)>();
 
-            let crypter = SLPcrypter::new(
-                input_rx,
-                update_tx,
-                handshake_config.rollover.preferred,
-                handshake_config.offset.preferred,
-                Some(handshake_succ_rx),
-            );
-            tokio::spawn(crypter.start());
+                let crypter = SLPcrypter::new(
+                    input_rx,
+                    update_tx,
+                    handshake_config.rollover.preferred,
+                    handshake_config.offset.preferred,
+                    Some(handshake_succ_rx),
+                );
+                tokio::spawn(crypter.start());
 
-            (Some(update_rx), Some(input_tx), Some(handshake_succ_tx))
-        } else {
-            (None, None, None)
+                (
+                    true,
+                    Some(update_rx),
+                    Some(input_tx),
+                    Some(handshake_succ_tx),
+                )
+            } else {
+                (false, None, None, None)
+            }
         };
 
         // Start listening for gamedata, transmitting input data and game events
@@ -349,7 +386,6 @@ impl SessionBuilder {
         let (net_gameevent_tx, net_gameevent_rx) = unbounded_channel::<DolphinEvent>();
 
         let send_buf_clone = send_buf.clone();
-        let encryption_enabled = self.encryption_enabled;
         let bootstrap_url = Some(
             self.bootstrap_url
                 .unwrap_or_else(|| DEFAULT_BOOTSTRAP_URL.to_string()),
@@ -399,8 +435,15 @@ impl SessionBuilder {
                     panic!("[net] invalid relay URL '{}': {}", relay_url, e);
                 }
             };
+            let handshake_state = Arc::new(Mutex::new(HandshakeState::new(
+                handshake_config,
+                meta.slp_version,
+                SSP_VERSION,
+            )));
+
             GameNet::connect(GameNetConnectArgs {
                 meta,
+                handshake_state,
                 runtime: SessionRuntime {
                     session_state: net_session_state,
                     connection_state: net_connection_state,

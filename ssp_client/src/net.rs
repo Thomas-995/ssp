@@ -102,6 +102,7 @@ pub(crate) struct GameNetConnectArgs {
     pub(crate) config: NetworkConfig,
     pub(crate) app_io: AppIo,
     pub(crate) dolphin_io: DolphinIo,
+    pub(crate) handshake_state: Arc<Mutex<HandshakeState>>,
 }
 
 struct DiscoveryConfig {
@@ -152,6 +153,7 @@ pub struct GameNet {
     send: GossipSender,
     endpoint: Arc<Endpoint>,
     encryption_enabled: bool,
+    handshake_state: Arc<Mutex<HandshakeState>>,
     secret_key: iroh::SecretKey,
     session_cancel_token: CancellationToken,
     current_seed_hash: Arc<Mutex<[u8; 32]>>,
@@ -186,7 +188,11 @@ impl GameNet {
             while let Ok(update) = crypter_key_rx.try_recv() {
                 match update {
                     CrypterUpdate::Key(new_key) => {
-                        self.next_key = Some(new_key.key);
+                        if self.current_key.is_none() {
+                            self.current_key = Some(new_key.key);
+                        } else {
+                            self.next_key = Some(new_key.key);
+                        }
                     }
                     CrypterUpdate::Rotate => {
                         if let Some(next) = self.next_key.take() {
@@ -346,13 +352,21 @@ impl GameNet {
             return;
         }
 
+        let locked_encryption = self
+            .handshake_state
+            .lock()
+            .await
+            .encryption_locked
+            .unwrap_or(self.encryption_enabled);
+        let actively_encrypting = self.encryption_enabled && locked_encryption;
+
+        if actively_encrypting && self.current_key.is_none() {
+            return;
+        }
+
         let maybe_out = {
-            let mut sb = self.send_buf.lock().await;
-            if !sb.is_empty() {
-                Some(sb.remove(0))
-            } else {
-                None
-            }
+            let sb = self.send_buf.lock().await;
+            sb.first().cloned()
         };
 
         if let Some(out) = maybe_out {
@@ -364,11 +378,28 @@ impl GameNet {
             })
             .expect("MsgPayload serialization must succeed");
 
-            let final_bytes = if self.encryption_enabled {
-                self.encrypt_data(&plaintext, &nonce).unwrap_or(plaintext)
+            let final_bytes = if actively_encrypting {
+                match self.encrypt_data(&plaintext, &nonce) {
+                    Some(encrypted) => encrypted,
+                    None => {
+                        debug_eprintln!("SSP encryption enabled but no usable key is available; dropping queued app payload");
+                        let mut sb = self.send_buf.lock().await;
+                        if !sb.is_empty() {
+                            sb.remove(0);
+                        }
+                        return;
+                    }
+                }
             } else {
                 plaintext
             };
+
+            {
+                let mut sb = self.send_buf.lock().await;
+                if !sb.is_empty() {
+                    sb.remove(0);
+                }
+            }
 
             let send_clone = self.send.clone();
             let from_clone = self.you();
@@ -478,6 +509,14 @@ impl GameNet {
 
     async fn pipe_incoming(&mut self) {
         let discovered = self.peer_discovered();
+        let locked_encryption = self
+            .handshake_state
+            .lock()
+            .await
+            .encryption_locked
+            .unwrap_or(self.encryption_enabled);
+        let actively_encrypting = self.encryption_enabled && locked_encryption;
+
         if let Some(msg) = self
             .pop_first_msg(|m| {
                 matches!(m.body, SLPMsgData::NewGame { .. })
@@ -488,8 +527,16 @@ impl GameNet {
             match msg.body {
                 SLPMsgData::Data { data, nonce } => {
                     debug_println!("SSP received Data message ({} bytes)", data.len());
-                    let payload_bytes = if self.encryption_enabled {
-                        self.decrypt_data(&data, &nonce).unwrap_or(data)
+                    let payload_bytes = if actively_encrypting {
+                        match self.decrypt_data(&data, &nonce) {
+                            Some(plaintext) => plaintext,
+                            None => {
+                                debug_eprintln!(
+                                    "Failed to decrypt encrypted SSP Data message; dropping"
+                                );
+                                return;
+                            }
+                        }
                     } else {
                         data
                     };
@@ -1109,7 +1156,6 @@ impl GameNet {
                 let slp_version_task = slp_version;
                 let peer_id = candidate.peer_id;
                 let peer_addr = candidate.peer_addr.clone();
-                let candidate_discovered_at = candidate.discovered_at;
                 let join_sender_for_task = join_sender.clone();
                 let cancel_task = cancel_on_connect.clone();
                 let failed_peers_for_task = failed_peers.clone();
@@ -1118,15 +1164,6 @@ impl GameNet {
                 let peer_handshook_for_task = peer_handshook.clone();
 
                 let handle = tokio::spawn(async move {
-                    let handshake_started_at = tokio::time::Instant::now();
-                    debug_println!(
-                        "[{:?}] Starting handshake with {:?} addr {} (candidate age {:?})",
-                        setup_started_at.elapsed(),
-                        peer_id,
-                        Self::endpoint_addr_summary(&peer_addr),
-                        candidate_discovered_at.elapsed()
-                    );
-
                     let mut peer = peer_addr;
                     if peer.is_empty() {
                         if let Some(ref relay) = relay_task {
@@ -1160,13 +1197,6 @@ impl GameNet {
                                     return;
                                 }
                                 let _ = peer_connected_for_task.send(true);
-                                debug_println!(
-                                    "[{:?}] Connected to peer {:?} (handshake task {:?}, candidate age {:?})",
-                                    setup_started_at.elapsed(),
-                                    peer_id,
-                                    handshake_started_at.elapsed(),
-                                    candidate_discovered_at.elapsed()
-                                );
                                 cancel_task.cancel();
                                 active_peers_for_task.lock().await.remove(&peer_id);
                             }
@@ -1229,14 +1259,6 @@ impl GameNet {
                                                 return;
                                             }
                                             let _ = peer_connected_for_task.send(true);
-                                            debug_println!(
-                                                "[{:?}] Connected to peer {:?} via n0 fallback {} (handshake task {:?}, candidate age {:?})",
-                                                setup_started_at.elapsed(),
-                                                peer_id,
-                                                n0_relay,
-                                                handshake_started_at.elapsed(),
-                                                candidate_discovered_at.elapsed()
-                                            );
                                             cancel_task.cancel();
                                             active_peers_for_task.lock().await.remove(&peer_id);
                                             return;
@@ -1286,6 +1308,7 @@ impl GameNet {
             config,
             app_io,
             dolphin_io,
+            handshake_state,
         } = args;
         let SessionRuntime {
             session_state,
@@ -1296,7 +1319,7 @@ impl GameNet {
         let NetworkConfig {
             encryption_enabled,
             discovery_mode,
-            handshake_config,
+            handshake_config: _,
             bootstrap_url,
             bootstrap_relay_url,
             timeouts,
@@ -1353,11 +1376,6 @@ impl GameNet {
             });
         }
 
-        let handshake_state = Arc::new(Mutex::new(HandshakeState::new(
-            handshake_config,
-            slp_version,
-            SSP_VERSION,
-        )));
         let (peer_connected_tx, mut peer_connected_rx) = tokio::sync::watch::channel(false);
 
         // Setup Discovery
@@ -1469,6 +1487,7 @@ impl GameNet {
             send: gossip_send,
             endpoint,
             encryption_enabled,
+            handshake_state,
             secret_key,
             session_cancel_token,
             current_seed_hash: current_seed_hash.clone(),
