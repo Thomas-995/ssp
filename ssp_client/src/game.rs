@@ -2,7 +2,7 @@
 
 use crate::crypter::{CrypterInput, CrypterUpdate, SLPcrypter};
 use crate::dolphin::{DolphinEvent, GameMeta, SLPreader};
-use crate::handshake::{HandshakeConfig, ParamRange, HandshakeState, SSP_VERSION};
+use crate::handshake::{HandshakeConfig, HandshakeState, ParamRange, SSP_VERSION};
 use crate::msg::Msg;
 use crate::net::{AppIo, DolphinIo, GameNet, GameNetConnectArgs, NetworkConfig, SessionRuntime};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -220,11 +220,12 @@ impl SessionBuilder {
         self
     }
 
-    /// Enable or disable input-based encryption (default: enabled).
+    /// Select the app-data encryption mode and strict accepted range.
     ///
-    /// By default this also makes the handshake accept only peers using the
-    /// same encryption mode. Override that policy with
-    /// [`SessionBuilder::set_encryption_acceptance`].
+    /// `true` means this session offers encrypted app data and accepts only
+    /// encrypted peers. `false` means it offers unencrypted app data and accepts
+    /// only unencrypted peers. Use [`SessionBuilder::set_encryption_acceptance`]
+    /// for custom ranges.
     pub fn set_encryption(mut self, enabled: bool) -> Self {
         self.encryption_enabled = enabled;
         self.handshake_config.encryption_enabled = enabled;
@@ -235,13 +236,16 @@ impl SessionBuilder {
 
     /// Configure which peer encryption modes are accepted during handshake.
     ///
-    /// Mixed encrypted/unencrypted data sessions are currently rejected even if
-    /// both flags are true, because app-data encryption is session-wide.
+    /// If encrypted peers are accepted, this endpoint offers encrypted app data
+    /// by default. If both modes are accepted, the first peer locks the whole
+    /// session to its mode; later peers must match that mode.
     pub fn set_encryption_acceptance(
         mut self,
         accept_encrypted: bool,
         accept_unencrypted: bool,
     ) -> Self {
+        self.encryption_enabled = accept_encrypted;
+        self.handshake_config.encryption_enabled = accept_encrypted;
         self.handshake_config.accept_encrypted = accept_encrypted;
         self.handshake_config.accept_unencrypted = accept_unencrypted;
         self
@@ -331,14 +335,12 @@ impl SessionBuilder {
         let handshake_config = self.handshake_config;
 
         let (encryption_enabled, crypter_key_rx, crypter_input_tx, handshake_succ_tx) = {
-            let mut enabled = self.encryption_enabled;
-            if enabled
-                && !self.handshake_config.accept_unencrypted
-                && !self.handshake_config.accept_encrypted
-            {
-                enabled = false;
-            }
-            if enabled {
+            // This internal flag means "capable of encrypted app data". If the
+            // handshake policy accepts encrypted peers, keep the crypter running
+            // even when our preferred offer mode is unencrypted; the first peer
+            // may lock the session to encrypted.
+            let encryption_capable = handshake_config.accept_encrypted;
+            if encryption_capable {
                 let (update_tx, update_rx) = unbounded_channel::<CrypterUpdate>();
                 let (input_tx, input_rx) = unbounded_channel::<CrypterInput>();
                 let (handshake_succ_tx, handshake_succ_rx) = unbounded_channel::<(u64, u64)>();
@@ -453,7 +455,6 @@ impl SessionBuilder {
                 config: NetworkConfig {
                     encryption_enabled,
                     discovery_mode,
-                    handshake_config,
                     bootstrap_url: bootstrap_url
                         .unwrap_or_else(|| DEFAULT_BOOTSTRAP_URL.to_string()),
                     bootstrap_relay_url,

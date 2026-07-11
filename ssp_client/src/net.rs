@@ -4,8 +4,7 @@ use crate::crypter::CrypterUpdate;
 use crate::dolphin::{DolphinEvent, GameMeta};
 use crate::game::{ConnectionState, DiscoveryMode, SessionState, TimeoutConfig};
 use crate::handshake::{
-    self, HandshakeConfig, HandshakeGuard, HandshakeGuardArgs, HandshakeState, SSP_ALPN,
-    SSP_VERSION,
+    self, HandshakeGuard, HandshakeGuardArgs, HandshakeState, SSP_ALPN, SSP_VERSION,
 };
 use crate::msg::{Msg, MsgPayload, SLPMsg, SLPMsgData};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -78,7 +77,6 @@ pub(crate) struct SessionRuntime {
 pub(crate) struct NetworkConfig {
     pub(crate) encryption_enabled: bool,
     pub(crate) discovery_mode: DiscoveryMode,
-    pub(crate) handshake_config: HandshakeConfig,
     pub(crate) bootstrap_url: String,
     pub(crate) bootstrap_relay_url: Option<iroh::RelayUrl>,
     pub(crate) timeouts: TimeoutConfig,
@@ -1319,7 +1317,6 @@ impl GameNet {
         let NetworkConfig {
             encryption_enabled,
             discovery_mode,
-            handshake_config: _,
             bootstrap_url,
             bootstrap_relay_url,
             timeouts,

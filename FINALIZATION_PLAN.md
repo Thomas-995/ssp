@@ -113,12 +113,14 @@ Potential sources to audit and tune:
      - webcam send-only
 
 5. **Repaint cadence**
-   - Avoid permanent 60fps repaint when not needed.
-   - Proposed cadence:
-     - active webcam: 33ms
-     - no webcam but in session: 100–250ms
-     - hidden/minimized/no session: slower
-   - Confirm current `request_repaint_after(16ms)` while connected is not causing Hyprland to mark the app unresponsive under load.
+   - Permanent session heartbeat repainting has been removed.
+   - Background workers now request repaint when they have new information to show:
+     - connect worker publishes a session
+     - background network I/O receives messages/voice/video/session-end
+     - webcam worker produces a new frame
+     - update checker changes state/progress
+   - The only delayed repaint left is a short voice-activity repaint while someone is talking, so the speaking border can clear after its timeout.
+   - Needs Hyprland review: confirm event-driven repainting does not leave stale UI and reduces compositor “not responding” notifications.
 
 6. **Audio backend/device enumeration**
    - JACK/ALSA probing emits noise and may block in some environments.
@@ -149,15 +151,18 @@ Questions / concerns:
 
 2. **Key availability semantics**
    - Implemented intended behavior:
-     - if encryption is enabled and no key exists, queued app data is not sent yet
+     - game seed should produce an initial key at game start, but this crosses async tasks/channels, so app data remains queued during the tiny race before `GameNet` receives the first key
      - first key emitted by the crypter becomes the active current key
      - if decryption fails, the message is dropped; ciphertext is not treated as plaintext
-     - if encryption is disabled, app data remains plaintext
-   - Still needs targeted tests for no-key, decrypt-failure, and unencrypted mode behavior.
+     - if encryption is disabled by the locked handshake mode, app data remains plaintext
+   - Still needs targeted tests for initial-key race, decrypt-failure, and unencrypted mode behavior.
 
 3. **Mixed encrypted/unencrypted sessions**
-   - Implemented policy: mixed encrypted/unencrypted sessions are rejected.
-   - Keep this unless app-data encryption becomes per-peer/per-message.
+   - Implemented policy: if a client accepts both encrypted and unencrypted peers, the first peer locks the session mode. Future peers must match that locked mode.
+   - `set_encryption(true)` is the strict encrypted-only selector; `set_encryption(false)` is the strict unencrypted-only selector.
+   - Custom acceptance ranges default to offering encrypted app data whenever encrypted peers are allowed.
+   - `ssp_app` relies on SSP defaults and uses encrypted-only mode, so it does not need an explicit `.set_encryption(true)` call.
+   - Keep session-wide locking unless app-data encryption becomes per-peer/per-message.
 
 4. **Handshake authenticity**
    - The handshake negotiates parameters over the Iroh connection.
